@@ -1,11 +1,14 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const cookieParser = require('cookie-parser'); // <-- ADD THIS
 const app = express();
 
 // --- Configuration ---
 const PORT = 7654;
 const LOG_DIR = './logs';
+const VIEWER_PIN = '280824'; // Your PIN
+const AUTH_COOKIE_NAME = 'nui-logger-auth';
 
 // --- Initialization ---
 if (!fs.existsSync(LOG_DIR)) {
@@ -14,13 +17,18 @@ if (!fs.existsSync(LOG_DIR)) {
 
 // --- Middleware ---
 app.use(express.json({ limit: '50mb' }));
-app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Headers', 'Content-Type');
-    res.header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-    if (req.method === 'OPTIONS') return res.sendStatus(200);
-    next();
-});
+app.use(express.urlencoded({ extended: true })); // <-- For parsing login form
+app.use(cookieParser()); // <-- For reading cookies
+
+// --- NEW: Authentication Middleware ---
+const checkAuth = (req, res, next) => {
+    if (req.cookies[AUTH_COOKIE_NAME] === VIEWER_PIN) {
+        // User is authenticated
+        return next();
+    }
+    // User is not authenticated, redirect to login
+    res.redirect('/login');
+};
 
 // --- Helper Functions ---
 function sanitizeResourceName(resourceName) {
@@ -43,7 +51,7 @@ function writeLog(resource, data) {
 
 // --- API Endpoints ---
 
-// Main logging endpoint
+// Main logging endpoint - DOES NOT require auth
 app.post('/log', (req, res) => {
     try {
         // --- NEW: Resource Name Parsing ---
@@ -83,8 +91,8 @@ app.post('/log', (req, res) => {
     }
 });
 
-// API for log data
-app.get('/logs', (req, res) => {
+// API for log data - NOW REQUIRES AUTH
+app.get('/logs', checkAuth, (req, res) => {
     try {
         const { resource } = req.query;
         if (!resource) {
@@ -107,8 +115,8 @@ app.get('/logs', (req, res) => {
     }
 });
 
-// Clear logs for a specific resource
-app.post('/clear', (req, res) => {
+// Clear logs for a specific resource - NOW REQUIRES AUTH
+app.post('/clear', checkAuth, (req, res) => {
     try {
         const { resource } = req.body;
         if (!resource) return res.status(400).json({ error: 'Resource name is required.' });
@@ -127,15 +135,56 @@ app.post('/clear', (req, res) => {
     }
 });
 
-// Health check
+// Health check - DOES NOT require auth
 app.get('/health', (req, res) => {
     res.json({ status: 'running', logDirectory: LOG_DIR, timestamp: new Date().toISOString() });
+});
+
+// --- NEW: Login Page Endpoints ---
+app.get('/login', (req, res) => {
+    const html = `
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NUI Logger - Login</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-gray-300 font-mono h-screen flex items-center justify-center">
+    <form class="bg-gray-800 p-8 rounded-lg shadow-lg" method="POST" action="/login">
+        <h1 class="text-white text-2xl font-bold mb-6 text-center">NUI Log Viewer</h1>
+        <label for="pin" class="block text-sm font-medium mb-2">Enter PIN</label>
+        <input type="password" id="pin" name="pin" class="w-full px-3 py-2 bg-gray-700 text-white rounded border border-gray-600 focus:outline-none focus:ring-2 focus:ring-cyan-500" autofocus>
+        <button type="submit" class="w-full bg-cyan-600 hover:bg-cyan-700 text-white font-bold py-2 px-4 rounded mt-6">Login</button>
+    </form>
+</body>
+</html>`;
+    res.setHeader('Content-Type', 'text/html');
+    res.send(html);
+});
+
+app.post('/login', (req, res) => {
+    const { pin } = req.body;
+    if (pin === VIEWER_PIN) {
+        // Correct PIN. Set a cookie that expires in 1 day.
+        res.cookie(AUTH_COOKIE_NAME, VIEWER_PIN, {
+            httpOnly: true,
+            secure: req.protocol === 'https', // Use 'secure' if running on HTTPS
+            maxAge: 24 * 60 * 60 * 1000 // 1 day
+        });
+        res.redirect('/view');
+    } else {
+        // Incorrect PIN
+        res.redirect('/login');
+    }
 });
 
 // --- Interactive Log Viewer ---
 app.get('/', (req, res) => res.redirect('/view'));
 
-app.get('/view', (req, res) => {
+// Main viewer page - NOW REQUIRES AUTH
+app.get('/view', checkAuth, (req, res) => {
     const html = `
 <!DOCTYPE html>
 <html lang="en" class="dark">
@@ -460,14 +509,15 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log('\n╔══════════════════════════════════════════════╗');
     console.log('║   🎮 FiveM NUI Interceptor Logger Server   ║');
     console.log('╚══════════════════════════════════════════════╝\n');
-    console.log(`✅ Server running, access the viewer at: http://localhost:${PORT}/view`);
+    console.log(`✅ Server running, access the viewer at: http://localhost:${PORT}/login`);
     console.log(`📁 Logging to directory: ${LOG_DIR}`);
-    console.log(`\nEndpoints:`);
-    console.log(`  POST /log         - Receive NUI intercepts`);
-    console.log(`  GET  /logs        - API: List all resources with logs`);
-    console.log(`  GET  /logs?resource=<name> - API: View last 200 logs for a resource`);
-    console.log(`  POST /clear       - API: Clear logs for a resource`);
-    console.log(`  GET  /health      - Health check\n`);
+    console.log(`  POST /log         - Receive NUI intercepts (Public)`);
+    console.log(`  GET  /login       - View login page`);
+    console.log(`  GET  /view        - View logs (PIN Required)`);
+    console.log(`  GET  /logs        - API: List resources (PIN Required)`);
+    console.log(`  GET  /logs?resource=<name> - API: View logs (PIN Required)`);
+    console.log(`  POST /clear       - API: Clear logs (PIN Required)`);
+    console.log(`  GET  /health      - Health check (Public)\n`);
     console.log('📡 Waiting for NUI data...\n');
 });
 
