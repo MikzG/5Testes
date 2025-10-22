@@ -1,7 +1,7 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const cookieParser = require('cookie-parser'); // <-- ADD THIS
+const cookieParser = require('cookie-parser');
 const app = express();
 
 // --- Configuration ---
@@ -17,28 +17,34 @@ if (!fs.existsSync(LOG_DIR)) {
 
 // --- Middleware ---
 app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true })); // <-- For parsing login form
-app.use(cookieParser()); // <-- For reading cookies
+app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
 
-// --- NEW: Authentication Middleware ---
+// --- Authentication Middleware ---
 const checkAuth = (req, res, next) => {
     if (req.cookies[AUTH_COOKIE_NAME] === VIEWER_PIN) {
-        // User is authenticated
         return next();
     }
-    // User is not authenticated, redirect to login
     res.redirect('/login');
 };
 
 // --- Helper Functions ---
-function sanitizeResourceName(resourceName) {
-    if (!resourceName || typeof resourceName !== 'string') return 'unknown_resource';
-    return resourceName.replace(/[^a-zA-Z0-9_-]/g, '_');
+function sanitizeName(name) { // Renamed from sanitizeResourceName
+    if (!name || typeof name !== 'string') return 'unknown';
+    return name.replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 
-function writeLog(resource, data) {
-    const safeResource = sanitizeResourceName(resource);
-    const logFilePath = path.join(LOG_DIR, `${safeResource}.jsonl`);
+function writeLog(server, resource, data) {
+    const safeServer = sanitizeName(server || 'default_server');
+    const safeResource = sanitizeName(resource);
+    
+    // Create server directory if it doesn't exist
+    const serverDir = path.join(LOG_DIR, safeServer);
+    if (!fs.existsSync(serverDir)) {
+        fs.mkdirSync(serverDir, { recursive: true });
+    }
+
+    const logFilePath = path.join(serverDir, `${safeResource}.jsonl`);
     const logEntry = { timestamp: new Date().toISOString(), ...data };
     const logLine = JSON.stringify(logEntry) + '\n';
     fs.appendFileSync(logFilePath, logLine);
@@ -46,18 +52,19 @@ function writeLog(resource, data) {
     const icons = { 'lua_to_nui': '📨', 'nui_to_lua': '📤', 'fetch_call': '🌐', 'console': '🖥️' };
     const icon = icons[data.type] || '📝';
     const logData = data.data || data.event || data.callback || data.url;
-    console.log(`${icon} [${safeResource} - ${data.type}]`, JSON.stringify(logData, null, 2));
+    console.log(`${icon} [${safeServer} / ${safeResource} - ${data.type}]`, JSON.stringify(logData, null, 2));
 }
 
 // --- API Endpoints ---
 
-// Main logging endpoint - DOES NOT require auth
+// Main logging endpoint
 app.post('/log', (req, res) => {
     try {
-        // --- NEW: Resource Name Parsing ---
+        const server = req.body.server;
         let actualResource = req.body.resource;
         const logData = { ...req.body };
-        delete logData.resource; // logData now only contains the log payload
+        delete logData.resource;
+        delete logData.server;
 
         try {
             let urlToParse = null;
@@ -68,22 +75,20 @@ app.post('/log', (req, res) => {
             }
 
             if (urlToParse) {
-                // Regex to find nui resource name (e.g., https://resource_name/...)
                 const match = urlToParse.match(/^https?:\/\/([a-zA-Z0-9_-]+)\//);
                 if (match && match[1]) {
-                    actualResource = match[1]; // We found a better resource name!
+                    actualResource = match[1];
                 }
             }
         } catch (e) {
             console.warn('Error parsing resource from log data:', e);
         }
-        // --- End of New Logic ---
 
         if (!actualResource) {
             return res.status(400).json({ error: 'Resource name is required.' });
         }
         
-        writeLog(actualResource, logData); // Use the corrected resource name
+        writeLog(server, actualResource, logData); // Use server and resource
         res.sendStatus(200);
     } catch (error) {
         console.error('❌ Error logging data:', error);
@@ -91,56 +96,80 @@ app.post('/log', (req, res) => {
     }
 });
 
-// API for log data - NOW REQUIRES AUTH
+// API for log data
 app.get('/logs', checkAuth, (req, res) => {
     try {
-        const { resource } = req.query;
-        if (!resource) {
-            const files = fs.readdirSync(LOG_DIR)
+        const { server, resource } = req.query;
+
+        if (server && resource) {
+            // Case 1: Get logs for a specific resource on a specific server
+            const safeServer = sanitizeName(server);
+            const safeResource = sanitizeName(resource);
+            const logFilePath = path.join(LOG_DIR, safeServer, `${safeResource}.jsonl`);
+            
+            if (!fs.existsSync(logFilePath)) return res.json([]);
+
+            const logs = fs.readFileSync(logFilePath, 'utf8')
+                .split('\n').filter(line => line.trim())
+                .map(line => JSON.parse(line)).slice(-200);
+            return res.json(logs);
+
+        } else if (server) {
+            // Case 2: Get all resources for a specific server
+            const safeServer = sanitizeName(server);
+            const serverDir = path.join(LOG_DIR, safeServer);
+            
+            if (!fs.existsSync(serverDir) || !fs.statSync(serverDir).isDirectory()) {
+                return res.json([]);
+            }
+
+            const files = fs.readdirSync(serverDir)
                 .filter(file => file.endsWith('.jsonl'))
                 .map(file => file.replace('.jsonl', ''));
             return res.json(files);
-        }
-        const safeResource = sanitizeResourceName(resource);
-        const logFilePath = path.join(LOG_DIR, `${safeResource}.jsonl`);
-        if (!fs.existsSync(logFilePath)) return res.json([]);
 
-        const logs = fs.readFileSync(logFilePath, 'utf8')
-            .split('\n').filter(line => line.trim())
-            .map(line => JSON.parse(line)).slice(-200);
-        res.json(logs);
+        } else {
+            // Case 3: Get all servers (directories)
+            const dirs = fs.readdirSync(LOG_DIR, { withFileTypes: true })
+                .filter(dirent => dirent.isDirectory())
+                .map(dirent => dirent.name);
+            return res.json(dirs);
+        }
     } catch (error) {
-        console.error(`❌ Error reading logs for "${req.query.resource}":`, error);
+        console.error(`❌ Error reading logs for "${req.query.server} / ${req.query.resource}":`, error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Clear logs for a specific resource - NOW REQUIRES AUTH
+// Clear logs for a specific resource
 app.post('/clear', checkAuth, (req, res) => {
     try {
-        const { resource } = req.body;
+        const { server, resource } = req.body;
+        if (!server) return res.status(400).json({ error: 'Server name is required.' });
         if (!resource) return res.status(400).json({ error: 'Resource name is required.' });
 
-        const safeResource = sanitizeResourceName(resource);
-        const logFilePath = path.join(LOG_DIR, `${safeResource}.jsonl`);
+        const safeServer = sanitizeName(server);
+        const safeResource = sanitizeName(resource);
+        const logFilePath = path.join(LOG_DIR, safeServer, `${safeResource}.jsonl`);
+
         if (fs.existsSync(logFilePath)) {
             fs.writeFileSync(logFilePath, '');
-            console.log(`🗑️ Logs cleared for resource: ${safeResource}`);
-            return res.json({ message: `Logs cleared for ${safeResource}` });
+            console.log(`🗑️ Logs cleared for: ${safeServer} / ${safeResource}`);
+            return res.json({ message: `Logs cleared for ${safeServer} / ${safeResource}` });
         }
-        return res.status(404).json({ message: `No logs found for ${safeResource}` });
+        return res.status(404).json({ message: `No logs found for ${safeServer} / ${safeResource}` });
     } catch (error) {
-        console.error(`❌ Error clearing logs for "${req.body.resource}":`, error);
+        console.error(`❌ Error clearing logs for "${req.body.server} / ${req.body.resource}":`, error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// Health check - DOES NOT require auth
+// Health check
 app.get('/health', (req, res) => {
     res.json({ status: 'running', logDirectory: LOG_DIR, timestamp: new Date().toISOString() });
 });
 
-// --- NEW: Login Page Endpoints ---
+// --- Login Page Endpoints ---
 app.get('/login', (req, res) => {
     const html = `
 <!DOCTYPE html>
@@ -167,15 +196,13 @@ app.get('/login', (req, res) => {
 app.post('/login', (req, res) => {
     const { pin } = req.body;
     if (pin === VIEWER_PIN) {
-        // Correct PIN. Set a cookie that expires in 1 day.
         res.cookie(AUTH_COOKIE_NAME, VIEWER_PIN, {
             httpOnly: true,
-            secure: req.protocol === 'https', // Use 'secure' if running on HTTPS
+            secure: req.protocol === 'https',
             maxAge: 24 * 60 * 60 * 1000 // 1 day
         });
         res.redirect('/view');
     } else {
-        // Incorrect PIN
         res.redirect('/login');
     }
 });
@@ -183,7 +210,7 @@ app.post('/login', (req, res) => {
 // --- Interactive Log Viewer ---
 app.get('/', (req, res) => res.redirect('/view'));
 
-// Main viewer page - NOW REQUIRES AUTH
+// Main viewer page
 app.get('/view', checkAuth, (req, res) => {
     const html = `
 <!DOCTYPE html>
@@ -202,23 +229,29 @@ app.get('/view', checkAuth, (req, res) => {
         .log-type-nui_to_lua  { border-left-color: #22c55e; }
         .log-type-fetch_call  { border-left-color: #eab308; }
         .log-type-console     { border-left-color: #a855f7; }
-        #toast-notification {
-            transition: opacity 0.3s ease-in-out;
-        }
+        #toast-notification { transition: opacity 0.3s ease-in-out; }
     </style>
 </head>
 <body class="bg-gray-900 text-gray-300 font-mono">
 <div class="flex h-screen">
-    <!-- Sidebar -->
+    <!-- Server List -->
     <div class="w-1/4 h-screen bg-gray-800 p-4 overflow-y-auto">
+        <h1 class="text-xl font-bold text-white mb-4">Servers</h1>
+        <div id="server-list" class="flex flex-col space-y-2"></div>
+    </div>
+
+    <!-- Resource List -->
+    <div class="w-1/4 h-screen bg-gray-800 p-4 overflow-y-auto border-l border-gray-700">
         <h1 class="text-xl font-bold text-white mb-4">Resources</h1>
         <div id="resource-list" class="flex flex-col space-y-2"></div>
     </div>
 
     <!-- Main Content -->
-    <div class="w-3/4 h-screen flex flex-col">
+    <div class="w-1/2 h-screen flex flex-col">
         <div id="log-header" class="p-4 bg-gray-800 border-b border-gray-700 flex items-center justify-between hidden">
-            <h2 class="text-lg font-bold text-white">Logs for <span id="current-resource" class="text-cyan-400"></span></h2>
+            <h2 class="text-lg font-bold text-white">
+                Logs for <span id="current-server" class="text-cyan-400"></span> / <span id="current-resource" class="text-cyan-400"></span>
+            </h2>
             <div>
                 <label class="mr-4">
                     <input type="checkbox" id="auto-refresh" class="align-middle"> Auto-refresh
@@ -229,20 +262,23 @@ app.get('/view', checkAuth, (req, res) => {
             </div>
         </div>
         <div id="log-container" class="flex-grow p-4 overflow-y-auto">
-            <div id="placeholder" class="text-gray-500">Select a resource to view logs.</div>
+            <div id="placeholder" class="text-gray-500">Select a server and resource to view logs.</div>
         </div>
     </div>
 </div>
 
 <script>
+    const serverList = document.getElementById('server-list');
     const resourceList = document.getElementById('resource-list');
     const logContainer = document.getElementById('log-container');
     const logHeader = document.getElementById('log-header');
+    const currentServerSpan = document.getElementById('current-server');
     const currentResourceSpan = document.getElementById('current-resource');
     const placeholder = document.getElementById('placeholder');
     const clearLogsBtn = document.getElementById('clear-logs-btn');
     const autoRefreshCheckbox = document.getElementById('auto-refresh');
 
+    let activeServer = null;
     let activeResource = null;
     let refreshInterval = null;
 
@@ -253,12 +289,10 @@ app.get('/view', checkAuth, (req, res) => {
         'console':    'text-purple-400',
     };
 
-    // --- NEW: Notification and Clipboard Helpers ---
+    // --- Notification and Clipboard Helpers ---
     function showToast(message, isError = false) {
-        // Remove existing toast
         const existingToast = document.getElementById('toast-notification');
         if (existingToast) existingToast.remove();
-
         const toast = document.createElement('div');
         toast.id = 'toast-notification';
         toast.className = \`fixed top-5 right-5 text-white py-2 px-4 rounded shadow-lg z-50 \${isError ? 'bg-red-500' : 'bg-green-500'}\`;
@@ -266,19 +300,13 @@ app.get('/view', checkAuth, (req, res) => {
         document.body.appendChild(toast);
         setTimeout(() => {
             toast.style.opacity = '0';
-            setTimeout(() => {
-                if(toast.parentElement) document.body.removeChild(toast);
-            }, 300);
+            setTimeout(() => { if(toast.parentElement) document.body.removeChild(toast); }, 300);
         }, 2000);
     }
 
     function copyToClipboard(text) {
         if (navigator.clipboard && window.isSecureContext) {
-            navigator.clipboard.writeText(text).then(() => {
-                showToast('Copied to clipboard!');
-            }, () => {
-                fallbackCopy(text); // Fallback
-            });
+            navigator.clipboard.writeText(text).then(() => showToast('Copied to clipboard!'), () => fallbackCopy(text));
         } else {
             fallbackCopy(text);
         }
@@ -287,13 +315,9 @@ app.get('/view', checkAuth, (req, res) => {
     function fallbackCopy(text) {
         const textArea = document.createElement('textarea');
         textArea.value = text;
-        textArea.style.position = 'fixed'; // Avoid scrolling
-        textArea.style.top = '0';
-        textArea.style.left = '0';
-        textArea.style.opacity = '0';
+        textArea.style.position = 'fixed'; textArea.style.top = '0'; textArea.style.left = '0'; textArea.style.opacity = '0';
         document.body.appendChild(textArea);
-        textArea.focus();
-        textArea.select();
+        textArea.focus(); textArea.select();
         try {
             document.execCommand('copy');
             showToast('Copied to clipboard!');
@@ -304,43 +328,55 @@ app.get('/view', checkAuth, (req, res) => {
     }
     // --- End Helpers ---
 
-    async function fetchResources() {
+    async function fetchServers() {
         try {
             const response = await fetch('/logs');
+            const servers = await response.json();
+            updateList(serverList, servers, selectServer);
+        } catch (error) {
+            console.error('Failed to fetch servers:', error);
+            serverList.innerHTML = '<div class="text-red-400">Error loading servers.</div>';
+        }
+    }
+
+    async function fetchResources(server) {
+        if (!server) {
+            resourceList.innerHTML = '';
+            return;
+        }
+        try {
+            const response = await fetch(\`/logs?server=\${server}\`);
             const resources = await response.json();
-            
-            // Track current buttons
-            const currentButtons = new Set(Array.from(resourceList.children).map(btn => btn.dataset.resource));
-            
-            // Add new buttons
-            resources.sort().forEach(resource => {
-                if (!currentButtons.has(resource)) {
-                    const button = document.createElement('button');
-                    button.textContent = resource;
-                    button.dataset.resource = resource;
-                    button.className = 'text-left p-2 rounded hover:bg-gray-700 focus:outline-none focus:bg-cyan-500 focus:text-white transition-colors';
-                    button.onclick = () => selectResource(resource);
-                    resourceList.appendChild(button);
-                }
-                currentButtons.delete(resource); // Mark as seen
-            });
-
-            // Remove old buttons (if a file was deleted)
-            currentButtons.forEach(resourceName => {
-                const btn = resourceList.querySelector(\`button[data-resource="\${resourceName}"]\`);
-                if(btn) btn.remove();
-            });
-
+            updateList(resourceList, resources, (resource) => selectResource(server, resource));
         } catch (error) {
             console.error('Failed to fetch resources:', error);
             resourceList.innerHTML = '<div class="text-red-400">Error loading resources.</div>';
         }
     }
+    
+    function updateList(listElement, items, onClickHandler) {
+        const currentButtons = new Set(Array.from(listElement.children).map(btn => btn.dataset.name));
+        items.sort().forEach(item => {
+            if (!currentButtons.has(item)) {
+                const button = document.createElement('button');
+                button.textContent = item;
+                button.dataset.name = item;
+                button.className = 'text-left p-2 rounded hover:bg-gray-700 focus:outline-none focus:bg-cyan-500 focus:text-white transition-colors';
+                button.onclick = () => onClickHandler(item);
+                listElement.appendChild(button);
+            }
+            currentButtons.delete(item);
+        });
+        currentButtons.forEach(itemName => {
+            const btn = listElement.querySelector(\`button[data-name="\${itemName}"]\`);
+            if(btn) btn.remove();
+        });
+    }
 
-    async function fetchLogs(resource) {
-        if (!resource) return;
+    async function fetchLogs(server, resource) {
+        if (!server || !resource) return;
         try {
-            const response = await fetch(\`/logs?resource=\${resource}\`);
+            const response = await fetch(\`/logs?server=\${server}&resource=\${resource}\`);
             const logs = await response.json();
             logContainer.innerHTML = '';
 
@@ -356,40 +392,24 @@ app.get('/view', checkAuth, (req, res) => {
                 const data = log.data || log.event || log.callback || { url: log.url, options: log.options };
                 const formattedData = JSON.stringify(data, null, 2);
                 
-                // --- NEW: Copy Command Logic ---
                 let copyButtonHTML = '';
                 let commandData = '';
-
                 try {
                     if (log.type === 'lua_to_nui') {
-                        // Command for lua_to_nui: top.citFrames['resource'].contentWindow.postMessage({event_data}, "*");
                         commandData = \`top.citFrames['\${activeResource}'].contentWindow.postMessage(\${JSON.stringify(log.event)}, "*");\`;
                     } else if (log.type === 'nui_to_lua' && log.callback) {
-                        // Command for nui_to_lua ($.post): $.post("url", JSON.stringify({data}));
                         commandData = \`$.post("\${log.callback}", JSON.stringify(\${JSON.stringify(log.data)}));\`;
                     } else if (log.type === 'fetch_call') {
-                        // Command for fetch_call: fetch("url", {options...});
                         const options = log.options || {};
-                        // body needs to be stringified *if it's not null/undefined*
                         const body = options.body !== null && options.body !== undefined ? JSON.stringify(options.body) : 'null';
                         commandData = \`fetch("\${log.url}", { \\n  method: "\${options.method || 'GET'}", \\n  headers: \${JSON.stringify(options.headers || {})}, \\n  body: \${body} \\n});\`;
                     }
-                } catch(e) {
-                    console.error('Error generating command:', e, log);
-                }
+                } catch(e) { console.error('Error generating command:', e, log); }
                 
                 if (commandData) {
-                    // Store command data in a data attribute, escaped for HTML
                     const escapedCommand = commandData.replace(/&/g, '&amp;').replace(/'/g, '&apos;').replace(/"/g, '&quot;');
-                    copyButtonHTML = \`
-                        <button class="copy-btn text-xs bg-gray-700 hover:bg-gray-600 text-gray-300 py-1 px-2 rounded"
-                                onclick="copyToClipboard(this.dataset.command)"
-                                data-command="\${escapedCommand}">
-                            Copy Cmd
-                        </button>
-                    \`;
+                    copyButtonHTML = \`<button class="copy-btn text-xs bg-gray-700 hover:bg-gray-600 text-gray-300 py-1 px-2 rounded" onclick="copyToClipboard(this.dataset.command)" data-command="\${escapedCommand}">Copy Cmd</button>\`;
                 }
-                // --- End Copy Command Logic ---
 
                 logEntry.innerHTML = \`
                     <div class="flex justify-between items-center mb-1">
@@ -409,21 +429,38 @@ app.get('/view', checkAuth, (req, res) => {
         }
     }
 
-    function selectResource(resource) {
+    function selectServer(server) {
+        activeServer = server;
+        activeResource = null; // Clear resource
+        
+        // Highlight server
+        document.querySelectorAll('#server-list button').forEach(btn => {
+            btn.classList.toggle('bg-cyan-500', btn.dataset.name === server);
+            btn.classList.toggle('text-white', btn.dataset.name === server);
+        });
+
+        fetchResources(server); // Fetch resources for this server
+        logContainer.innerHTML = '<div class="text-gray-500">Select a resource to view logs.</div>';
+        logHeader.classList.add('hidden');
+        placeholder.classList.remove('hidden');
+        stopAutoRefresh();
+    }
+
+    function selectResource(server, resource) {
+        activeServer = server;
         activeResource = resource;
+        currentServerSpan.textContent = server;
         currentResourceSpan.textContent = resource;
         logHeader.classList.remove('hidden');
         placeholder.classList.add('hidden');
         
+        // Highlight resource
         document.querySelectorAll('#resource-list button').forEach(btn => {
-            if (btn.dataset.resource === resource) {
-                btn.classList.add('bg-cyan-500', 'text-white');
-            } else {
-                btn.classList.remove('bg-cyan-500', 'text-white');
-            }
+            btn.classList.toggle('bg-cyan-500', btn.dataset.name === resource);
+            btn.classList.toggle('text-white', btn.dataset.name === resource);
         });
 
-        fetchLogs(resource);
+        fetchLogs(server, resource);
         if (autoRefreshCheckbox.checked) {
             startAutoRefresh();
         } else {
@@ -431,9 +468,8 @@ app.get('/view', checkAuth, (req, res) => {
         }
     }
     
-    // --- NEW: Custom Confirm Modal for Clear Logs ---
     async function clearLogs() {
-        if (!activeResource) return;
+        if (!activeServer || !activeResource) return;
         
         const existingModal = document.getElementById('confirm-modal');
         if (existingModal) existingModal.remove();
@@ -443,7 +479,7 @@ app.get('/view', checkAuth, (req, res) => {
         customConfirm.className = 'fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center z-50';
         customConfirm.innerHTML = \`
             <div class="bg-gray-800 p-6 rounded shadow-lg">
-                <p class="text-white mb-4">Are you sure you want to clear all logs for <strong class="text-cyan-400">\${activeResource}</strong>?</p>
+                <p class="text-white mb-4">Are you sure you want to clear all logs for <strong class="text-cyan-400">\${activeServer} / \${activeResource}</strong>?</p>
                 <div class="flex justify-end space-x-2">
                     <button id="confirm-cancel" class="bg-gray-600 hover:bg-gray-700 text-white py-2 px-4 rounded">Cancel</button>
                     <button id="confirm-ok" class="bg-red-600 hover:bg-red-700 text-white py-2 px-4 rounded">Clear</button>
@@ -461,10 +497,10 @@ app.get('/view', checkAuth, (req, res) => {
                 await fetch('/clear', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ resource: activeResource })
+                    body: JSON.stringify({ server: activeServer, resource: activeResource })
                 });
-                fetchLogs(activeResource); // Refresh logs
-                showToast(\`Logs cleared for \${activeResource}\`);
+                fetchLogs(activeServer, activeResource); // Refresh logs
+                showToast(\`Logs cleared for \${activeServer} / \${activeResource}\`);
             } catch(error) {
                 console.error("Failed to clear logs:", error);
                 showToast("Failed to clear logs.", true);
@@ -474,8 +510,8 @@ app.get('/view', checkAuth, (req, res) => {
 
     function startAutoRefresh() {
         if (refreshInterval) clearInterval(refreshInterval);
-        if (activeResource) {
-            refreshInterval = setInterval(() => fetchLogs(activeResource), 2000);
+        if (activeServer && activeResource) {
+            refreshInterval = setInterval(() => fetchLogs(activeServer, activeResource), 2000);
         }
     }
 
@@ -494,8 +530,8 @@ app.get('/view', checkAuth, (req, res) => {
     });
 
     // Initial load
-    fetchResources();
-    setInterval(fetchResources, 5000); // Refresh resource list every 5 seconds
+    fetchServers();
+    setInterval(fetchServers, 5000); // Refresh server list every 5 seconds
 </script>
 </body>
 </html>`;
@@ -514,8 +550,9 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`  POST /log         - Receive NUI intercepts (Public)`);
     console.log(`  GET  /login       - View login page`);
     console.log(`  GET  /view        - View logs (PIN Required)`);
-    console.log(`  GET  /logs        - API: List resources (PIN Required)`);
-    console.log(`  GET  /logs?resource=<name> - API: View logs (PIN Required)`);
+    console.log(`  GET  /logs        - API: List servers (PIN Required)`);
+    console.log(`  GET  /logs?server=<name> - API: List resources (PIN Required)`);
+    console.log(`  GET  /logs?server=<name>&resource=<name> - API: View logs (PIN Required)`);
     console.log(`  POST /clear       - API: Clear logs (PIN Required)`);
     console.log(`  GET  /health      - Health check (Public)\n`);
     console.log('📡 Waiting for NUI data...\n');
